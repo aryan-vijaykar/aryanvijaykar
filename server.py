@@ -46,7 +46,8 @@ def read_identity_patch() -> bytes:
 
 
 UPSTREAM_LIMIT = threading.BoundedSemaphore(6)
-
+# Abort upstream fetches that stall (AWS ALB has a 60 s idle timeout).
+UPSTREAM_TIMEOUT = 25
 
 def patch_html(source: str, local_origin: str) -> str:
     """Attach the identity layer without editing upstream markup.
@@ -124,8 +125,9 @@ class IdentityProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(patch)
             return
 
-        if self.path == "/api/health":
-            payload = b'{"ok":true,"mode":"identity-proxy","runtime":"python"}'
+        if self.path in {"/api/health", "/health"}:
+            import time as _time
+            payload = f'{{"ok":true,"mode":"identity-proxy","runtime":"python","uptime":{int(_time.monotonic())}}}'.encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -153,7 +155,7 @@ class IdentityProxyHandler(BaseHTTPRequestHandler):
         connection = None
         try:
             for attempt in range(4):
-                connection = http.client.HTTPSConnection(REMOTE_HOST, timeout=30)
+                connection = http.client.HTTPSConnection(REMOTE_HOST, timeout=UPSTREAM_TIMEOUT)
                 with UPSTREAM_LIMIT:
                     connection.request(self.command, target_path, body=request_body, headers=request_headers)
                     upstream = connection.getresponse()
@@ -223,6 +225,8 @@ class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
 
 
 def serve_loopback() -> None:
+    import signal
+
     # 0.0.0.0 accepts connections from any interface (local network, containers, cloud hosts).
     servers = [ThreadingHTTPServer(("0.0.0.0", PORT), IdentityProxyHandler)]
     try:
@@ -237,10 +241,21 @@ def serve_loopback() -> None:
     for server in servers:
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
+    # Graceful shutdown — required by ECS, Elastic Beanstalk, and EC2 Auto Scaling.
+    # SIGTERM is sent before the instance/container is stopped.
+    def _shutdown(signum: int, _frame: object) -> None:
+        sig_name = signal.Signals(signum).name
+        print(f"{sig_name} received — shutting down gracefully")
+        for srv in servers:
+            threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     try:
         while True:
             time.sleep(1)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         for server in servers:
             server.shutdown()
 

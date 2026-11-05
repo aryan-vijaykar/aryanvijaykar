@@ -30,6 +30,12 @@ const IDENTITY_PATCH_PATH = path.join(__dirname, 'identity-patch.js');
 const readIdentityPatch = () => fs.readFileSync(IDENTITY_PATCH_PATH);
 const UPSTREAM_AGENT = new https.Agent({ keepAlive: true, maxSockets: 6 });
 
+// Request timeout: abort upstream fetches that stall (AWS ALB has a 60 s idle timeout).
+const UPSTREAM_TIMEOUT_MS = 25000;
+// Server-level keep-alive timeout must exceed the ALB idle timeout (60 s) to avoid
+// a race where ALB reuses a connection the Node server has already half-closed.
+const SERVER_KEEPALIVE_MS = 65000;
+
 /**
  * Attach the identity layer without editing upstream markup.
  *
@@ -86,9 +92,9 @@ function proxyRequest(request, response) {
     return;
   }
 
-  if (request.url === '/api/health') {
+  if (request.url === '/api/health' || request.url === '/health') {
     response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-    response.end(JSON.stringify({ ok: true, mode: 'identity-proxy' }));
+    response.end(JSON.stringify({ ok: true, mode: 'identity-proxy', uptime: Math.floor(process.uptime()) }));
     return;
   }
 
@@ -104,7 +110,8 @@ function proxyRequest(request, response) {
     const upstream = https.request(target, {
       method: request.method,
       headers,
-      agent: UPSTREAM_AGENT
+      agent: UPSTREAM_AGENT,
+      timeout: UPSTREAM_TIMEOUT_MS
     }, (upstreamResponse) => {
       const chunks = [];
       upstreamResponse.on('data', (chunk) => chunks.push(chunk));
@@ -141,6 +148,10 @@ function proxyRequest(request, response) {
       });
     });
 
+    upstream.on('timeout', () => {
+      upstream.destroy(new Error(`Upstream timed out after ${UPSTREAM_TIMEOUT_MS}ms`));
+    });
+
     upstream.on('error', (error) => {
       if (retryable && attempt < 3) {
         setTimeout(() => makeUpstreamRequest(attempt + 1), 200 * (2 ** attempt));
@@ -158,8 +169,13 @@ function proxyRequest(request, response) {
   makeUpstreamRequest();
 }
 
+const servers = [];
+
 const listen = (host, label) => {
   const server = http.createServer(proxyRequest);
+  // Prevent 502s on AWS ALB: keep-alive timeout must exceed ALB's 60 s idle timeout.
+  server.keepAliveTimeout = SERVER_KEEPALIVE_MS;
+  server.headersTimeout = SERVER_KEEPALIVE_MS + 5000;
   server.on('error', (error) => {
     if (['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL'].includes(error.code)) {
       console.log(`${label} unavailable (${error.code})`);
@@ -168,12 +184,34 @@ const listen = (host, label) => {
     throw error;
   });
   server.listen(PORT, host, () => console.log(`Listening → http://${label}:${PORT}`));
+  servers.push(server);
 };
 
 // 0.0.0.0 accepts connections from any interface (local network, containers, cloud hosts).
-// 127.0.0.1 / ::1 cover the loopback families so both `localhost` and `127.0.0.1` work
-// in the browser on Windows (where `localhost` resolves to ::1 first).
+// ::1 covers IPv6 loopback so `localhost` works on Windows (resolves to ::1 first).
 listen('0.0.0.0', '0.0.0.0');
 listen('::1', 'localhost');
 console.log(`Upstream: ${REMOTE_ORIGIN}`);
 console.log('Portfolio identity proxy ready.');
+
+// Graceful shutdown — required by ECS, Elastic Beanstalk, and EC2 Auto Scaling.
+// SIGTERM is sent before the instance/container is stopped. We stop accepting new
+// connections and wait for in-flight requests to finish (up to 10 s).
+const shutdown = (signal) => {
+  console.log(`${signal} received — shutting down gracefully`);
+  const deadline = setTimeout(() => {
+    console.error('Shutdown deadline exceeded — forcing exit');
+    process.exit(1);
+  }, 10000);
+  deadline.unref(); // don't keep the event loop alive just for this timer
+  let pending = servers.length;
+  servers.forEach((server) => server.close(() => {
+    if (--pending === 0) {
+      console.log('All connections closed — exiting');
+      process.exit(0);
+    }
+  }));
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
