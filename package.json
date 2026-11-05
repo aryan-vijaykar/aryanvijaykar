@@ -1,1 +1,13 @@
-{"name":"aryan-vijaykar-portfolio","private":true,"scripts":{"start":"node server.js","start:python":"python server.py"}}
+{
+  "name": "aryan-vijaykar-portfolio",
+  "version": "1.0.0",
+  "description": "Identity proxy serving Aryan Vijaykar's developer portfolio.",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "start:python": "python server.py"
+  }
+}

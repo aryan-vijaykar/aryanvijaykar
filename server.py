@@ -16,12 +16,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+# Load .env file if present (no external dependencies needed).
+_env_path = Path(__file__).with_name(".env")
+if _env_path.exists():
+    for _line in _env_path.read_text(encoding="utf-8").splitlines():
+        _m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$", _line)
+        if _m and _m.group(1) not in os.environ:
+            os.environ[_m.group(1)] = _m.group(2).strip("\"'")
+
 PORT = int(os.environ.get("PORT", "3000"))
 
-# The upstream portfolio site. Override via UPSTREAM_ORIGIN env var.
+# The upstream portfolio site. Set UPSTREAM_ORIGIN in .env or the environment.
 _upstream_origin = os.environ.get("UPSTREAM_ORIGIN", "").rstrip("/")
 if not _upstream_origin:
-    raise SystemExit("UPSTREAM_ORIGIN env var is required (e.g. https://example.com)")
+    raise SystemExit(
+        "Error: UPSTREAM_ORIGIN is not set.\n"
+        "  Create a .env file with:  UPSTREAM_ORIGIN=https://example.com\n"
+        "  Or run:  UPSTREAM_ORIGIN=https://example.com python server.py"
+    )
 REMOTE_ORIGIN = _upstream_origin
 REMOTE_HOST = _upstream_origin.removeprefix("https://").removeprefix("http://")
 
@@ -34,11 +46,6 @@ def read_identity_patch() -> bytes:
 
 
 UPSTREAM_LIMIT = threading.BoundedSemaphore(6)
-
-
-def replace_status_near_title(html: str, title: str, status: str) -> str:
-    pattern = re.compile(f"({re.escape(title)}[\\s\\S]{{0,2500}}?)Expires May 2027")
-    return pattern.sub(lambda match: f"{match.group(1)}{status}", html)
 
 
 def patch_html(source: str, local_origin: str) -> str:
@@ -216,15 +223,16 @@ class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
 
 
 def serve_loopback() -> None:
-    servers = [ThreadingHTTPServer(("127.0.0.1", PORT), IdentityProxyHandler)]
+    # 0.0.0.0 accepts connections from any interface (local network, containers, cloud hosts).
+    servers = [ThreadingHTTPServer(("0.0.0.0", PORT), IdentityProxyHandler)]
     try:
         servers.append(IPv6ThreadingHTTPServer(("::1", PORT), IdentityProxyHandler))
     except OSError as error:  # pragma: no cover - host without IPv6 loopback
-        print(f"IPv6 loopback unavailable, serving IPv4 only ({error})")
+        print(f"IPv6 loopback unavailable ({error})")
 
-    print(f"http://localhost:{PORT}")
-    print(f"http://127.0.0.1:{PORT}")
-    print("Portfolio identity proxy active for Aryan Vijaykar")
+    print(f"Listening → http://localhost:{PORT}")
+    print(f"Upstream:   {REMOTE_ORIGIN}")
+    print("Portfolio identity proxy ready.")
 
     for server in servers:
         threading.Thread(target=server.serve_forever, daemon=True).start()

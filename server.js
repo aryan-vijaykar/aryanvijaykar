@@ -3,12 +3,25 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
+// Load .env file if present (no external dependencies needed).
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  fs.readFileSync(envPath, 'utf8')
+    .split('\n')
+    .forEach((line) => {
+      const match = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (match && !process.env[match[1]]) process.env[match[1]] = match[2].replace(/^["']|["']$/g, '');
+    });
+}
+
 const PORT = Number(process.env.PORT) || 3000;
 
-// The upstream portfolio site. Override via UPSTREAM_ORIGIN env var.
+// The upstream portfolio site. Set UPSTREAM_ORIGIN in .env or the environment.
 const REMOTE_ORIGIN = (process.env.UPSTREAM_ORIGIN || '').replace(/\/$/, '');
 if (!REMOTE_ORIGIN) {
-  console.error('UPSTREAM_ORIGIN env var is required (e.g. https://example.com)');
+  console.error('Error: UPSTREAM_ORIGIN is not set.');
+  console.error('  Create a .env file with:  UPSTREAM_ORIGIN=https://example.com');
+  console.error('  Or run:  UPSTREAM_ORIGIN=https://example.com npm start');
   process.exit(1);
 }
 
@@ -16,13 +29,6 @@ const IDENTITY_PATCH_PATH = path.join(__dirname, 'identity-patch.js');
 // Read per request so edits apply without a restart.
 const readIdentityPatch = () => fs.readFileSync(IDENTITY_PATCH_PATH);
 const UPSTREAM_AGENT = new https.Agent({ keepAlive: true, maxSockets: 6 });
-
-const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-function replaceStatusNearTitle(html, title, status) {
-  const pattern = new RegExp(`(${escapeRegExp(title)}[\\s\\S]{0,2500}?)Expires May 2027`, 'g');
-  return html.replace(pattern, `$1${status}`);
-}
 
 /**
  * Attach the identity layer without editing upstream markup.
@@ -152,8 +158,6 @@ function proxyRequest(request, response) {
   makeUpstreamRequest();
 }
 
-// Bind both loopback families: `localhost` resolves to ::1 first on Windows,
-// so an IPv4-only listener makes the browser report a refused connection.
 const listen = (host, label) => {
   const server = http.createServer(proxyRequest);
   server.on('error', (error) => {
@@ -163,9 +167,13 @@ const listen = (host, label) => {
     }
     throw error;
   });
-  server.listen(PORT, host, () => console.log(`http://${label}:${PORT}`));
+  server.listen(PORT, host, () => console.log(`Listening → http://${label}:${PORT}`));
 };
 
-listen('127.0.0.1', '127.0.0.1');
+// 0.0.0.0 accepts connections from any interface (local network, containers, cloud hosts).
+// 127.0.0.1 / ::1 cover the loopback families so both `localhost` and `127.0.0.1` work
+// in the browser on Windows (where `localhost` resolves to ::1 first).
+listen('0.0.0.0', '0.0.0.0');
 listen('::1', 'localhost');
-console.log('Portfolio identity proxy active for Aryan Vijaykar');
+console.log(`Upstream: ${REMOTE_ORIGIN}`);
+console.log('Portfolio identity proxy ready.');
